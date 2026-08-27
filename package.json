@@ -1,6 +1,6 @@
 {
   "name": "indesign-mcp-server",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "A comprehensive Model Context Protocol (MCP) server for Adobe InDesign automation with 35+ professional tools",
   "main": "index.js",
   "type": "module",

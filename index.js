@@ -16,12 +16,24 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// InDesign transport differs by OS: macOS drives InDesign via AppleScript,
+// Windows via COM automation. The ExtendScript payloads the tools generate are
+// identical on both platforms — only the "run this script in InDesign" step changes.
+// Overridable via env vars so a different InDesign version can be targeted without
+// editing code.
+//   INDESIGN_APP_NAME  — AppleScript application name (macOS), e.g. "Adobe InDesign 2024"
+//   INDESIGN_PROGID    — COM ProgID (Windows), e.g. "InDesign.Application.2025" to pin a version
+const INDESIGN_APP_NAME = process.env.INDESIGN_APP_NAME || 'Adobe InDesign 2025';
+const INDESIGN_PROGID = process.env.INDESIGN_PROGID || 'InDesign.Application';
+// idScriptLanguage.javascript — stable across InDesign versions, same value on Mac and Windows.
+const INDESIGN_JS_LANGUAGE = 1246973031;
+
 class InDesignMCPServer {
   constructor() {
     this.server = new Server(
       {
         name: 'indesign-server-complete',
-        version: '1.0.0',
+        version: '1.1.0',
       },
       {
         capabilities: {
@@ -626,7 +638,7 @@ class InDesignMCPServer {
 
   async executeInDesignScript(script) {
     const tempScript = path.join(__dirname, 'temp_script.jsx');
-    
+
     // Enhanced error handling wrapper
     const wrappedScript = `
       try {
@@ -635,23 +647,74 @@ class InDesignMCPServer {
         "ERROR: " + error.message + " (Line: " + (error.line || "unknown") + ")";
       }
     `;
-    
-    fs.writeFileSync(tempScript, wrappedScript);
+
+    fs.writeFileSync(tempScript, wrappedScript, 'utf8');
 
     try {
-      const appleScript = `
-        tell application "Adobe InDesign 2025"
-          activate
-          do script POSIX file "${tempScript}" language javascript
-        end tell
-      `;
-      
-      const result = await this.executeAppleScript(appleScript);
-      return result;
+      if (process.platform === 'darwin') {
+        const appleScript = `
+          tell application "${INDESIGN_APP_NAME}"
+            activate
+            do script POSIX file "${tempScript}" language javascript
+          end tell
+        `;
+        return await this.executeAppleScript(appleScript);
+      }
+
+      if (process.platform === 'win32') {
+        return await this.executeWindowsInDesignScript(tempScript);
+      }
+
+      throw new Error(
+        `Unsupported platform "${process.platform}": InDesign automation requires macOS (AppleScript) or Windows (COM).`
+      );
     } finally {
       if (fs.existsSync(tempScript)) {
         fs.unlinkSync(tempScript);
       }
+    }
+  }
+
+  // Windows COM bridge. InDesign exposes the same DoScript entry point AppleScript uses,
+  // reachable via COM automation. We generate a short VBScript that reads the .jsx,
+  // runs it through DoScript, and writes the result to a temp file — reading the result
+  // from a file (rather than cscript's stdout) sidesteps console codepage/encoding issues.
+  async executeWindowsInDesignScript(jsxPath) {
+    const outPath = path.join(__dirname, 'temp_out.txt');
+    const vbsPath = path.join(__dirname, 'temp_run.vbs');
+
+    // Backslash-escape paths for embedding as VBScript string literals.
+    const esc = (p) => p.replace(/\\/g, '\\\\');
+    const vbs = `
+      Set fso = CreateObject("Scripting.FileSystemObject")
+      Set inFile = fso.OpenTextFile("${esc(jsxPath)}", 1, False, -1)
+      code = inFile.ReadAll
+      inFile.Close
+      On Error Resume Next
+      Set app = GetObject(, "${INDESIGN_PROGID}")
+      If app Is Nothing Then Set app = CreateObject("${INDESIGN_PROGID}")
+      If Err.Number <> 0 Then
+        result = "ERROR: cannot attach to InDesign (${INDESIGN_PROGID}): " & Err.Description
+      Else
+        result = app.DoScript(code, ${INDESIGN_JS_LANGUAGE})
+        If Err.Number <> 0 Then result = "ERROR: " & Err.Description
+      End If
+      Set outFile = fso.CreateTextFile("${esc(outPath)}", True, True)
+      outFile.Write result
+      outFile.Close
+    `;
+    fs.writeFileSync(vbsPath, vbs, 'utf8');
+
+    try {
+      execSync(`cscript //nologo "${vbsPath}"`, { timeout: 30000 });
+      // CreateTextFile(..., True) writes UTF-16LE, so read it back as such.
+      return fs.existsSync(outPath) ? fs.readFileSync(outPath, 'utf16le').trim() : '';
+    } catch (error) {
+      throw new Error(`Windows InDesign COM execution failed: ${error.message}`);
+    } finally {
+      [vbsPath, outPath].forEach((p) => {
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+      });
     }
   }
 

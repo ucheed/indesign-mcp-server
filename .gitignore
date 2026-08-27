@@ -49,6 +49,8 @@ jspm_packages/
 
 # InDesign temporary files
 temp_script.jsx
+temp_run.vbs
+temp_out.txt
 *.jsx~
 
 # IDE files
